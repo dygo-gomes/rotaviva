@@ -326,6 +326,22 @@ def load_geojson():
     name_col = next((c for c in candidates if c in gdf.columns), gdf.columns[0])
     gdf["BAIRRO_NORM"] = gdf[name_col].astype(str).str.strip().str.upper()
 
+    # Versão sem acentos para merge com CSV
+    import unicodedata
+    def _sem_acento(s):
+        return "".join(
+            c for c in unicodedata.normalize("NFD", str(s))
+            if unicodedata.category(c) != "Mn"
+        ).upper().strip()
+
+    gdf["BAIRRO_SA"] = gdf["BAIRRO_NORM"].apply(_sem_acento)
+
+    # Mapeamento de exceções (nome no shapefile sem acento → nome no CSV)
+    excecoes = {
+        "CIDADE INDUSTRIAL DE CURITIBA": "CIDADE INDUSTRIAL",
+    }
+    gdf["BAIRRO_SA"] = gdf["BAIRRO_SA"].replace(excecoes)
+
     return gdf
 
 geojson_data = load_geojson()
@@ -732,32 +748,42 @@ with col_popup:
 
 with col_mapa:
     if geojson_data is not None:
-        # Merge ocorrências no GeoDataFrame
+        # Merge ocorrências no GeoDataFrame (BAIRRO_SA já sem acentos = mesmo formato do CSV)
         gdf_mapa = geojson_data.merge(
             ocorr_bairro,
-            left_on="BAIRRO_NORM",
+            left_on="BAIRRO_SA",
             right_on="bairro",
             how="left",
         )
         gdf_mapa["ocorrencias"] = gdf_mapa["ocorrencias"].fillna(0).astype(int)
 
-        # Centro e zoom
-        map_location = [-25.4284, -49.2733]
-        map_zoom     = 11
-
-        if bairro_sel != "— Selecione —":
-            _geom = geojson_data[geojson_data["BAIRRO_NORM"] == bairro_sel]
-            if not _geom.empty:
-                _centroid    = _geom.geometry.centroid.iloc[0]
-                map_location = [_centroid.y, _centroid.x]
-                map_zoom     = 14
-
         # ── Mapa base cinza (CartoDB Positron) ──
         m = folium.Map(
-            location=map_location,
-            zoom_start=map_zoom,
+            location=[-25.4284, -49.2733],
+            zoom_start=11,
             tiles="CartoDB positron",
         )
+
+        # Centro e zoom para st_folium
+        import math
+
+        def zoom_para_bounds(bounds, map_w=1050, map_h=520, padding=0.02):
+            minx, miny, maxx, maxy = bounds
+            lon_span = (maxx - minx) * (1 + padding) or 0.001
+            lat_span = (maxy - miny) * (1 + padding) or 0.001
+            z_lon = math.log2(map_w * 360 / (256 * lon_span))
+            z_lat = math.log2(map_h * 170 / (256 * lat_span))
+            return max(12, min(18, math.floor(min(z_lon, z_lat))))
+
+        map_center = [-25.4284, -49.2733]
+        map_zoom   = 11
+        if bairro_sel != "— Selecione —":
+            _geom = geojson_data[geojson_data["BAIRRO_SA"] == bairro_sel]
+            if not _geom.empty:
+                b          = _geom.geometry.total_bounds
+                c          = _geom.geometry.centroid.iloc[0]
+                map_center = [c.y, c.x]
+                map_zoom   = zoom_para_bounds(b)
 
         # ── Contorno amarelo dos bairros ──
         folium.GeoJson(
@@ -830,7 +856,8 @@ with col_mapa:
             },
         ).add_to(m)
 
-        st_folium(m, use_container_width=True, height=520, returned_objects=[], key=f"map_{bairro_sel}")
+        st_folium(m, use_container_width=True, height=520, returned_objects=[],
+                  center=map_center, zoom=map_zoom, key=f"map_{bairro_sel}")
 
     else:
         # ── Fallback: Mapa de Calor Tabular (quando GeoJSON não disponível) ──
