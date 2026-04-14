@@ -6,12 +6,16 @@ Período: 01/04/2025 a 31/03/2026
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 import numpy as np
 import json
 import requests
 import os
+import random
 import geopandas as gpd
+from shapely.geometry import Point
+import folium
+from folium.plugins import HeatMap
+from streamlit_folium import st_folium
 
 # ─────────────────────────────────────────────
 # CONFIGURAÇÃO DA PÁGINA
@@ -269,51 +273,60 @@ df = load_data()
 # ─────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_geojson():
-    """
-    Carrega o mapa dos bairros de Curitiba usando GeoPandas com múltiplas fontes de redundância.
-    """
     import io
-    local = "bairros_curitiba.geojson"
+    shp_local   = "DIVISA_DE_BAIRROS.shp"
+    geojson_local = "bairros_curitiba.geojson"
+
+    # URLs de fallback
     urls = [
-        "https://raw.githubusercontent.com/gjeanmart/curitiba-neighborhoods/main/curitiba_neighborhoods.geojson",
-        "https://raw.githubusercontent.com/andrelambert/curitiba-bairros/main/bairros.geojson"
+        "https://raw.githubusercontent.com/codeforgermany/click_that_hood/main/public/data/curitiba.geojson",
+        "https://raw.githubusercontent.com/luizpedone/municipal-brazilian-geodata/master/data/Curitiba.json",
     ]
-    
+
     gdf = None
-    
-    # 1. Tentar carregar arquivo local
-    if os.path.exists(local):
+
+    # 1. Shapefile local do IPPUC (prioridade máxima)
+    if os.path.exists(shp_local):
         try:
-            gdf = gpd.read_file(local)
-        except: pass
-    
-    # 2. Se não houver local, tentar as URLs
+            gdf = gpd.read_file(shp_local)
+        except Exception:
+            pass
+
+    # 2. GeoJSON local salvo anteriormente
+    if gdf is None and os.path.exists(geojson_local):
+        try:
+            gdf = gpd.read_file(geojson_local)
+        except Exception:
+            pass
+
+    # 3. URLs remotas
     if gdf is None:
         for url in urls:
             try:
-                r = requests.get(url, timeout=15)
+                r = requests.get(url, timeout=20)
                 if r.status_code == 200:
                     gdf = gpd.read_file(io.StringIO(r.text))
+                    with open(geojson_local, "w", encoding="utf-8") as f:
+                        f.write(r.text)
                     break
-            except: continue
+            except Exception:
+                continue
 
     if gdf is None:
         return None
 
-    try:
-        # Garantir que o CRS está em WGS84 (EPSG:4326) para o Plotly Mapbox
-        if gdf.crs is None:
-            gdf.set_crs(epsg=4326, inplace=True)
-        elif gdf.crs != "EPSG:4326":
-            gdf = gdf.to_crs(epsg=4326)
-            
-        # Identificar a coluna de nome do bairro e normalizar para MAIÚSCULAS
-        candidates = ["NOME", "nome", "NM_BAIRRO", "BAIRRO", "name"]
-        name_col = next((c for c in candidates if c in gdf.columns), gdf.columns[0])
-        gdf["BAIRRO_NORM"] = gdf[name_col].astype(str).str.strip().str.upper()
-        return gdf
-    except Exception:
-        return None
+    # CRS → WGS84
+    if gdf.crs is None:
+        gdf.set_crs(epsg=4326, inplace=True)
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    # Identificar coluna de nome do bairro
+    candidates = ["NOME", "nome", "NM_BAIRRO", "name", "NAME", "BAIRRO", "bairro", "nm_bairro"]
+    name_col = next((c for c in candidates if c in gdf.columns), gdf.columns[0])
+    gdf["BAIRRO_NORM"] = gdf[name_col].astype(str).str.strip().str.upper()
+
+    return gdf
 
 geojson_data = load_geojson()
 
@@ -719,48 +732,105 @@ with col_popup:
 
 with col_mapa:
     if geojson_data is not None:
-        # Merge com ocorrências
-        fig_mapa = px.choropleth_mapbox(
+        # Merge ocorrências no GeoDataFrame
+        gdf_mapa = geojson_data.merge(
             ocorr_bairro,
-            geojson=geojson_data,
-            locations="bairro",
-            featureidkey="properties.BAIRRO_NORM",
-            color="ocorrencias",
-            color_continuous_scale=[
-                [0.0,  "#FEFEFE"],
-                [0.25, COR_GRAY_L],
-                [0.5,  COR_NAVY],
-                [0.75, "#8B1E20"],
-                [1.0,  COR_RED],
-            ],
-            mapbox_style="carto-positron",
-            zoom=10.5,
-            center={"lat": -25.4284, "lon": -49.2733},
-            opacity=0.75,
-            labels={"ocorrencias": "Ocorrências"},
-            hover_name="bairro",
-            hover_data={"ocorrencias": True, "bairro": False},
+            left_on="BAIRRO_NORM",
+            right_on="bairro",
+            how="left",
+        )
+        gdf_mapa["ocorrencias"] = gdf_mapa["ocorrencias"].fillna(0).astype(int)
+
+        # Centro e zoom
+        map_location = [-25.4284, -49.2733]
+        map_zoom     = 11
+
+        if bairro_sel != "— Selecione —":
+            _geom = geojson_data[geojson_data["BAIRRO_NORM"] == bairro_sel]
+            if not _geom.empty:
+                _centroid    = _geom.geometry.centroid.iloc[0]
+                map_location = [_centroid.y, _centroid.x]
+                map_zoom     = 14
+
+        # ── Mapa base cinza (CartoDB Positron) ──
+        m = folium.Map(
+            location=map_location,
+            zoom_start=map_zoom,
+            tiles="CartoDB positron",
         )
 
-        fig_mapa.update_traces(
-            marker_line_width=1.2,
-            marker_line_color="white"
-        )
+        # ── Contorno amarelo dos bairros ──
+        folium.GeoJson(
+            data=geojson_data,
+            style_function=lambda _: {
+                "fillOpacity": 0,
+                "color":       COR_YELLOW,
+                "weight":      2.0,
+                "opacity":     1.0,
+            },
+            interactive=False,
+        ).add_to(m)
 
-        fig_mapa.update_layout(
-            height=520,
-            margin=dict(l=0, r=0, t=0, b=0),
-            coloraxis_colorbar=dict(
-                title="Ocorr.",
-                tickfont=dict(family="Barlow", size=11),
-                title_font=dict(family="Barlow", size=12),
-                thickness=14,
-                len=0.6,
-            ),
-            font=dict(family="Barlow"),
-        )
+        # ── Labels com o nome de cada bairro ──
+        for _, row in geojson_data.iterrows():
+            try:
+                centroid = row.geometry.centroid
+                nome     = row["BAIRRO_NORM"]
+                folium.Marker(
+                    location=[centroid.y, centroid.x],
+                    icon=folium.DivIcon(
+                        html=(
+                            f'<div style="font-size:10px;font-weight:900;'
+                            f'color:#FFCD28;font-family:sans-serif;'
+                            f'white-space:nowrap;'
+                            f'text-shadow:1px 1px 3px #000,-1px -1px 3px #000,'
+                            f'1px -1px 3px #000,-1px 1px 3px #000;">'
+                            f'{nome}</div>'
+                        ),
+                        icon_size=(140, 20),
+                        icon_anchor=(70, 10),
+                    ),
+                ).add_to(m)
+            except Exception:
+                continue
 
-        st.plotly_chart(fig_mapa, use_container_width=True)
+        # ── HeatMap: pontos distribuídos dentro de cada polígono ──
+        random.seed(42)
+        max_ocorr = gdf_mapa["ocorrencias"].max() or 1
+        heat_data = []
+
+        for _, row in gdf_mapa.iterrows():
+            if row["ocorrencias"] <= 0:
+                continue
+            # Número de pontos proporcional às ocorrências (máx 60 por bairro)
+            n_pts  = max(1, round(row["ocorrencias"] / max_ocorr * 60))
+            geom   = row.geometry
+            bounds = geom.bounds  # minx, miny, maxx, maxy
+            added, tries = 0, 0
+            while added < n_pts and tries < n_pts * 15:
+                x = random.uniform(bounds[0], bounds[2])
+                y = random.uniform(bounds[1], bounds[3])
+                if geom.contains(Point(x, y)):
+                    heat_data.append([y, x, 1])
+                    added += 1
+                tries += 1
+
+        HeatMap(
+            heat_data,
+            min_opacity=0.4,
+            max_zoom=15,
+            radius=18,
+            blur=15,
+            gradient={
+                0.2: "rgba(254,254,254,0.0)",
+                0.45: COR_GRAY_L,
+                0.65: COR_NAVY,
+                0.85: "#8B1E20",
+                1.0:  COR_RED,
+            },
+        ).add_to(m)
+
+        st_folium(m, use_container_width=True, height=520, returned_objects=[], key=f"map_{bairro_sel}")
 
     else:
         # ── Fallback: Mapa de Calor Tabular (quando GeoJSON não disponível) ──
